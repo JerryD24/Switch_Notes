@@ -1612,3 +1612,791 @@ Step 4: Scaling & Trade-offs (5 min)
 ● Security: JWT, OAuth2, API keys, encryption at rest/transit
 ● Rate limiting to protect backend services
 ```
+
+---
+---
+
+## 13. Design Netflix (Video Streaming Platform)
+
+### What It Does
+● Allows users to browse, search, and stream video content (movies, series) on-demand.
+● Handles massive scale — 200M+ subscribers, thousands of concurrent streams, content available globally.
+
+---
+
+### Functional Requirements
+● User registration, login, and profile management (multiple profiles per account).
+● Browse and search content catalog (by genre, trending, recommendations).
+● Stream video in adaptive quality based on user's bandwidth.
+● Resume playback from where the user left off.
+● Support multiple devices (mobile, TV, web, tablet) simultaneously.
+● Content upload and encoding pipeline (admin/studio side).
+
+### Non-Functional Requirements
+● High availability — 99.99% uptime (users should never see "service unavailable").
+● Low latency — video should start playing within 2-3 seconds.
+● Scalable — support millions of concurrent streams globally.
+● Adaptive streaming — adjust video quality dynamically based on network conditions.
+● Content should be cached close to users (CDN) for minimal buffering.
+
+---
+
+### Capacity Estimation
+● Daily active users: ~100M
+● Concurrent streams at peak: ~10M
+● Average video size: ~3 GB (multiple resolutions)
+● Total content library: ~15,000 titles × 3 GB × 5 resolutions = ~225 TB
+● Bandwidth per stream: 5 Mbps (HD)
+● Peak bandwidth: 10M × 5 Mbps = 50 Tbps (served via CDN)
+
+---
+
+### HLD Architecture
+
+```
+                              ┌────────────────┐
+       Client (App/Web) ─────►│   API Gateway   │
+                              └───────┬────────┘
+                                      │
+              ┌───────────────────────┼───────────────────────┐
+              │                       │                       │
+       ┌──────▼───────┐      ┌───────▼───────┐      ┌───────▼───────┐
+       │ User Service  │      │ Catalog/Search│      │ Streaming     │
+       │ (auth,profile)│      │ Service       │      │ Service       │
+       └──────┬───────┘      └───────┬───────┘      └───────┬───────┘
+              │                      │                       │
+       ┌──────▼───────┐      ┌──────▼────────┐      ┌──────▼────────┐
+       │   User DB     │      │ Elasticsearch  │      │     CDN       │
+       │  (MySQL)      │      │ (search index) │      │ (video files) │
+       └──────────────┘      └───────────────┘      └───────────────┘
+                                                            │
+                                                     ┌──────▼────────┐
+                                                     │  Object Store  │
+                                                     │  (S3 — master  │
+                                                     │   video files) │
+                                                     └───────────────┘
+```
+
+#### Additional Components
+```
+┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ Recommendation   │     │ Video Processing  │     │ Analytics        │
+│ Service (ML)     │     │ Pipeline          │     │ Service          │
+│ (what to watch)  │     │ (encoding/transcoding)│ │ (views, watch    │
+└─────────────────┘     └──────────────────┘     │  history)        │
+                                                  └──────────────────┘
+```
+
+---
+
+### LLD Key Components
+
+#### Video Upload & Processing Pipeline
+```
+Studio uploads video
+    │
+    ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Upload to S3  │────►│ Transcoding   │────►│ Store encoded │
+│ (raw master)  │     │ Service       │     │ files in S3   │
+└──────────────┘     │ (FFmpeg)      │     └──────┬───────┘
+                     │               │            │
+                     │ Encode into:  │     ┌──────▼───────┐
+                     │  240p, 360p,  │     │ Push to CDN   │
+                     │  480p, 720p,  │     │ (edge servers) │
+                     │  1080p, 4K    │     └──────────────┘
+                     └──────────────┘
+```
+
+● Videos are broken into **small chunks** (2-10 seconds each) at each resolution.
+● Each chunk is independently downloadable — enables adaptive bitrate streaming.
+
+#### Adaptive Bitrate Streaming (ABR)
+```
+Client starts playing at 720p
+    │
+    ▼ bandwidth drops
+Client switches to 480p (seamless, no rebuffer)
+    │
+    ▼ bandwidth recovers
+Client switches back to 720p
+
+Protocol: HLS (HTTP Live Streaming) or DASH (Dynamic Adaptive Streaming over HTTP)
+
+Manifest file (.m3u8) contains URLs for all chunks at all quality levels:
+  /video/123/720p/chunk_001.ts
+  /video/123/720p/chunk_002.ts
+  /video/123/480p/chunk_001.ts
+  /video/123/480p/chunk_002.ts
+  ...
+```
+
+#### CDN (Content Delivery Network)
+```
+● Videos cached on edge servers close to users worldwide.
+● User in India → served from Mumbai edge server (not US origin).
+● Netflix has its own CDN called Open Connect — dedicated servers placed inside ISP data centers.
+● Reduces latency, reduces bandwidth cost, reduces load on origin servers.
+```
+
+#### Recommendation Engine
+```
+Two approaches:
+  1. Collaborative Filtering — "Users similar to you also watched X"
+  2. Content-Based Filtering — "You watched action movies, here are more action movies"
+
+Data signals:
+  ● Watch history, watch time, ratings
+  ● Search queries, browse behavior
+  ● Time of day, device type
+  ● Genre preferences
+
+Output: Personalized homepage with ranked content rows
+```
+
+#### Database Schema (Simplified)
+```sql
+CREATE TABLE users (
+    user_id     BIGINT PRIMARY KEY,
+    email       VARCHAR(255) UNIQUE,
+    plan_type   VARCHAR(20),         -- BASIC, STANDARD, PREMIUM
+    created_at  TIMESTAMP
+);
+
+CREATE TABLE content (
+    content_id   BIGINT PRIMARY KEY,
+    title        VARCHAR(255),
+    description  TEXT,
+    genre        VARCHAR(100),
+    duration_min INT,
+    release_year INT,
+    rating       DECIMAL(3,1)
+);
+
+CREATE TABLE watch_history (
+    user_id      BIGINT,
+    content_id   BIGINT,
+    progress_sec INT,               -- resume from here
+    last_watched TIMESTAMP,
+    PRIMARY KEY (user_id, content_id)
+);
+```
+
+#### Key Interview Points
+● **Why chunks?** — Enables adaptive streaming, parallel downloads, and seeking without downloading entire file.
+● **CDN is the backbone** — 95%+ of Netflix traffic is served from CDN, not origin servers.
+● **Microservices at Netflix** — 700+ microservices. Each team owns a service (auth, billing, recommendations, streaming, etc.).
+● **Chaos Engineering** — Netflix invented Chaos Monkey (randomly kills production instances) to ensure resilience.
+● **Data pipeline** — Kafka + Apache Spark for processing billions of streaming events daily for analytics and recommendations.
+
+---
+---
+
+## 14. Design Facebook / Instagram (Social Media Platform)
+
+### What It Does
+● Allows users to create profiles, post content (text/images/videos), follow other users, like/comment, and see a personalized news feed.
+● Handles billions of users, posts, and interactions daily.
+
+---
+
+### Functional Requirements
+● User registration, login, profile management.
+● Create posts (text, images, videos).
+● Follow/unfollow other users.
+● News feed — personalized timeline showing posts from people you follow.
+● Like, comment, and share posts.
+● Search for users and content.
+● Push notifications for likes, comments, follows.
+● Direct messaging (1:1 and group).
+
+### Non-Functional Requirements
+● High availability — platform must be up 99.99%.
+● News feed latency < 200ms.
+● Support billions of users and trillions of posts.
+● Eventual consistency is acceptable for feed (slight delay is OK).
+● Media storage at massive scale (petabytes of images/videos).
+
+---
+
+### Capacity Estimation
+● Daily active users: ~2 Billion (Facebook)
+● Posts per day: ~500 Million
+● Average post size: ~1 KB text + 500 KB image = ~500 KB
+● Storage per day: 500M × 500 KB = ~250 TB/day
+● Read:Write ratio: ~100:1 (people read feed much more than they post)
+● News feed QPS: ~100M concurrent users × 10 feed refreshes/day = ~1B feed requests/day ≈ ~12K QPS
+
+---
+
+### HLD Architecture
+
+```
+                              ┌────────────────┐
+       Client (App/Web) ─────►│   API Gateway   │
+                              └───────┬────────┘
+                                      │
+         ┌────────────────────────────┼────────────────────────────┐
+         │              │             │             │               │
+  ┌──────▼──────┐ ┌────▼─────┐ ┌────▼─────┐ ┌────▼─────┐ ┌──────▼──────┐
+  │ User Service│ │Post      │ │Feed      │ │Search    │ │Notification │
+  │             │ │Service   │ │Service   │ │Service   │ │Service      │
+  └──────┬──────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └─────────────┘
+         │              │            │             │
+  ┌──────▼──────┐ ┌────▼─────┐ ┌────▼─────┐ ┌────▼──────┐
+  │  User DB    │ │ Post DB  │ │Feed Cache│ │Elastic    │
+  │  (MySQL)    │ │(Cassandra)│ │ (Redis)  │ │search     │
+  └─────────────┘ └────┬─────┘ └──────────┘ └───────────┘
+                       │
+                 ┌─────▼──────┐
+                 │ Media Store │
+                 │ (S3 + CDN)  │
+                 └────────────┘
+```
+
+---
+
+### LLD Key Components
+
+#### News Feed Generation (The Core Problem)
+
+Two approaches:
+
+**Approach 1: Fan-out on Write (Push Model)**
+```
+When User A creates a post:
+  1. Post saved to Post DB
+  2. Fetch all followers of User A (say 1000 followers)
+  3. Push the post_id into each follower's feed cache (Redis list)
+
+When User B opens their feed:
+  1. Read pre-computed feed from Redis → instant, no computation needed
+
+Pros: Feed reads are super fast (pre-computed).
+Cons: Celebrity problem — a user with 100M followers means 100M writes per post (expensive).
+```
+
+**Approach 2: Fan-out on Read (Pull Model)**
+```
+When User B opens their feed:
+  1. Fetch list of users B follows
+  2. Fetch recent posts from each of them
+  3. Merge and rank posts by timestamp/relevance
+  4. Return top N posts
+
+Pros: No wasted writes (only compute feed when requested).
+Cons: Feed reads are slow (lots of DB queries at read time).
+```
+
+**Approach 3: Hybrid (What Facebook/Instagram Actually Uses)**
+```
+● For regular users (< 10K followers): Fan-out on Write (push to follower feeds)
+● For celebrities (> 10K followers): Fan-out on Read (fetch their posts at read time)
+
+This avoids the celebrity problem while keeping reads fast for most users.
+```
+
+#### Feed Ranking Algorithm
+```
+Instead of simple chronological order, rank posts by:
+  ● Recency (newer posts score higher)
+  ● Relationship (close friends rank higher)
+  ● Engagement (posts with more likes/comments rank higher)
+  ● Content type (videos may rank differently than text)
+  ● User interest (based on past interactions)
+
+Score = w1 × recency + w2 × relationship + w3 × engagement + w4 × interest
+Sort by score descending → return top N
+```
+
+#### Image/Media Upload Flow
+```
+Client uploads image
+    │
+    ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Upload Service│────►│ Image Process │────►│ Store in S3   │
+│               │     │ (resize,     │     │ + push to CDN │
+│               │     │  compress,   │     └──────────────┘
+│               │     │  thumbnails) │
+│               │     └──────────────┘
+└──────────────┘
+
+Generate multiple sizes:
+  ● Thumbnail (150x150)
+  ● Medium (600x600)
+  ● Full (1080x1080)
+
+Store each size separately → serve appropriate size based on device/context
+```
+
+#### Database Choices
+```
+● User data       → MySQL (relational, ACID — account info, credentials)
+● Posts            → Cassandra (write-heavy, time-series, distributed)
+● Feed cache       → Redis (in-memory, fast reads, sorted sets for ranked feed)
+● Social graph     → MySQL or Graph DB (who follows whom)
+● Media files      → S3 + CDN
+● Search index     → Elasticsearch
+● Analytics        → Hadoop / Apache Spark
+```
+
+#### Database Schema (Simplified)
+```sql
+-- User table (MySQL)
+CREATE TABLE users (
+    user_id     BIGINT PRIMARY KEY,
+    username    VARCHAR(50) UNIQUE,
+    email       VARCHAR(255) UNIQUE,
+    bio         TEXT,
+    profile_pic VARCHAR(500),
+    created_at  TIMESTAMP
+);
+
+-- Follow relationship (MySQL)
+CREATE TABLE follows (
+    follower_id  BIGINT,
+    followee_id  BIGINT,
+    created_at   TIMESTAMP,
+    PRIMARY KEY (follower_id, followee_id)
+);
+CREATE INDEX idx_followee ON follows(followee_id);
+
+-- Posts (Cassandra — partition by user_id, cluster by timestamp)
+CREATE TABLE posts (
+    post_id     BIGINT,
+    user_id     BIGINT,
+    content     TEXT,
+    media_urls  LIST<TEXT>,
+    like_count  BIGINT,
+    created_at  TIMESTAMP,
+    PRIMARY KEY (user_id, created_at)  -- partition by user, sorted by time
+) WITH CLUSTERING ORDER BY (created_at DESC);
+
+-- Likes (Cassandra)
+CREATE TABLE likes (
+    post_id   BIGINT,
+    user_id   BIGINT,
+    created_at TIMESTAMP,
+    PRIMARY KEY (post_id, user_id)
+);
+
+-- Comments (Cassandra)
+CREATE TABLE comments (
+    post_id    BIGINT,
+    comment_id BIGINT,
+    user_id    BIGINT,
+    content    TEXT,
+    created_at TIMESTAMP,
+    PRIMARY KEY (post_id, created_at)
+) WITH CLUSTERING ORDER BY (created_at ASC);
+```
+
+#### Feed Cache Structure (Redis)
+```
+Key:   feed:{user_id}
+Type:  Sorted Set (ZSET)
+Score: timestamp (or ranking score)
+Value: post_id
+
+ZADD feed:123 1679012345 "post_456"
+ZADD feed:123 1679012400 "post_789"
+
+ZREVRANGE feed:123 0 19    → Get top 20 posts (most recent first)
+```
+
+#### Key Interview Points
+● **Fan-out on Write vs Read** — The hybrid approach is the real answer. Know the celebrity problem.
+● **Social graph** — Can use adjacency list in MySQL or a graph DB (Neo4j) for complex queries like "mutual friends."
+● **Sharding strategy** — Shard posts by user_id (all posts of a user on same shard). Shard feed cache by user_id.
+● **Hot partition** — Celebrity posts can overload one partition. Solution: replicate hot data, or use separate handling.
+● **Consistency** — Feed is eventually consistent (slight delay in seeing a new post is acceptable). Likes/comments can be eventually consistent too.
+● **Photo storage** — Never store images in the database. Use object storage (S3) and serve via CDN.
+
+---
+---
+
+## 15. Cloud Migration System Design
+
+### What It Does
+● Migrates an existing on-premise application (monolith or distributed) to a cloud platform (AWS, Azure, GCP).
+● Involves moving infrastructure, data, applications, and services with minimal downtime and zero data loss.
+
+---
+
+### Migration Strategies (The 6 R's)
+
+| Strategy | What It Means | When to Use |
+|----------|--------------|-------------|
+| **Rehost (Lift & Shift)** | Move as-is to cloud VMs (EC2). No code changes. | Quick migration, legacy apps, tight deadline |
+| **Replatform (Lift & Reshape)** | Minor optimizations (e.g., switch to managed DB like RDS). No major code changes. | Want some cloud benefits without full rewrite |
+| **Repurchase** | Replace with SaaS (e.g., move CRM to Salesforce). | Off-the-shelf solution available |
+| **Refactor (Re-architect)** | Rewrite as cloud-native (microservices, containers, serverless). | Long-term scalability, performance needs |
+| **Retire** | Decommission the application (no longer needed). | Redundant or unused systems |
+| **Retain** | Keep on-premise (not ready to migrate). | Compliance, dependency, or cost reasons |
+
+---
+
+### HLD — Migration Architecture
+
+```
+Phase 1: Assessment & Planning
+  ┌──────────────────────────────────────────┐
+  │ Inventory all applications and databases  │
+  │ Identify dependencies between services    │
+  │ Choose migration strategy per application │
+  │ Estimate cost and timeline               │
+  └──────────────────────────────────────────┘
+
+Phase 2: Infrastructure Setup (Cloud)
+  ┌──────────────────────────────────────────┐
+  │ VPC, Subnets, Security Groups            │
+  │ IAM Roles and Policies                   │
+  │ Managed services (RDS, ElastiCache, SQS) │
+  │ CI/CD pipeline setup                     │
+  │ Monitoring (CloudWatch, Prometheus)       │
+  └──────────────────────────────────────────┘
+
+Phase 3: Data Migration
+  ┌──────────────────────────────────────────┐
+  │ On-Premise DB ──► AWS DMS ──► Cloud DB   │
+  │ (continuous replication until cutover)     │
+  │ Validate data integrity (row counts,      │
+  │  checksums, business rule validation)     │
+  └──────────────────────────────────────────┘
+
+Phase 4: Application Migration
+  ┌──────────────────────────────────────────┐
+  │ Deploy application on cloud infra         │
+  │ Parallel run (both envs active)           │
+  │ Route % traffic to cloud (canary)         │
+  │ Monitor errors, latency, correctness      │
+  └──────────────────────────────────────────┘
+
+Phase 5: Cutover & Decommission
+  ┌──────────────────────────────────────────┐
+  │ 100% traffic to cloud                     │
+  │ Final data sync                           │
+  │ DNS switch                                │
+  │ Decommission on-premise servers           │
+  │ Post-migration validation                 │
+  └──────────────────────────────────────────┘
+```
+
+---
+
+### LLD Key Components
+
+#### Data Migration Pattern (Zero Downtime)
+```
+Step 1: Full dump — Copy entire DB from on-premise to cloud (may take hours/days)
+Step 2: CDC (Change Data Capture) — Continuously replicate changes happening on source during migration
+Step 3: Validation — Compare source and target (row counts, checksums)
+Step 4: Cutover — Stop writes on source, wait for CDC to drain, switch app to cloud DB
+
+Tools: AWS DMS, Debezium (CDC), Oracle GoldenGate, pg_dump + logical replication
+
+Timeline:
+  t=0          t=6 hours         t=6h 5min      t=6h 10min
+  |── Full Dump ──|── CDC running ──|── Cutover ──|── Live on Cloud ──►
+  (source active)  (both active)   (brief freeze) (source off)
+```
+
+#### Monolith to Microservices (Strangler Fig Pattern)
+```
+Instead of rewriting everything at once, gradually replace pieces of the monolith:
+
+┌────────────────────────────────────┐
+│          MONOLITH                   │
+│  ┌──────┐ ┌──────┐ ┌──────┐       │
+│  │ Auth │ │Orders│ │Payments│      │    Step 1: Monolith handles everything
+│  └──────┘ └──────┘ └───────┘       │
+└────────────────────────────────────┘
+
+       ▼ Extract Auth first
+
+┌────────────────────────────────────┐     ┌──────────────┐
+│          MONOLITH                   │     │ Auth Service  │
+│           ┌──────┐ ┌──────┐        │     │ (new, cloud)  │
+│           │Orders│ │Payments│      │     └──────────────┘
+│           └──────┘ └───────┘       │         Step 2: Auth extracted
+└────────────────────────────────────┘
+
+       ▼ Extract Orders next
+
+┌────────────────────────────────────┐     ┌──────────────┐
+│          MONOLITH                   │     │ Auth Service  │
+│                    ┌──────┐        │     ├──────────────┤
+│                    │Payments│      │     │ Order Service │
+│                    └───────┘       │     └──────────────┘
+└────────────────────────────────────┘         Step 3: Orders extracted
+
+       ▼ Until monolith is empty and decommissioned
+```
+
+● Route requests via **API Gateway** — old endpoints go to monolith, migrated endpoints go to new microservice.
+● Gradually shift traffic until monolith is empty.
+
+#### Containerization (Docker + Kubernetes)
+```
+On-Premise (VMs):                    Cloud (Containers):
+┌──────────────────┐                ┌──────────────────────────┐
+│ VM 1: App Server │    ────►       │ Kubernetes Cluster        │
+│ VM 2: App Server │                │  ┌─────┐ ┌─────┐ ┌─────┐│
+│ VM 3: DB Server  │                │  │Pod 1│ │Pod 2│ │Pod 3││
+└──────────────────┘                │  └─────┘ └─────┘ └─────┘│
+                                    │  Auto-scaling, self-healing│
+                                    └──────────────────────────┘
+
+Benefits:
+  ● Auto-scaling based on traffic
+  ● Self-healing (restart failed containers automatically)
+  ● Rolling deployments (zero-downtime deploys)
+  ● Resource efficiency (multiple containers on one VM)
+```
+
+#### Key Interview Points
+● **Zero-downtime migration** — Use CDC (Change Data Capture) for continuous replication. Cutover window should be seconds, not hours.
+● **Strangler Fig Pattern** — Incrementally replace monolith components. Safest approach for large systems.
+● **Dual-write problem** — During migration, both old and new systems may be active. Ensure idempotency and data consistency.
+● **Rollback plan** — Always have the ability to switch back to on-premise if something goes wrong.
+● **Cost management** — Cloud can be expensive. Use reserved instances, auto-scaling, spot instances, and right-sizing.
+● **Security** — Encrypt data in transit (TLS) and at rest (KMS). IAM policies for least-privilege access. VPC for network isolation.
+● **Compliance** — Financial services (JP Morgan) require data residency (data stays in specific regions), audit trails, and encryption standards.
+
+---
+---
+
+## 16. Flash Sale System (like Amazon Lightning Deals)
+
+### What It Does
+● Sells a limited quantity of items at a discounted price for a short time window.
+● Thousands to millions of users compete to buy a few hundred/thousand items simultaneously.
+● Must prevent overselling, handle massive traffic spikes, and ensure fairness.
+
+---
+
+### Functional Requirements
+● Admin creates a flash sale (product, discounted price, quantity, start time, end time).
+● Users see countdown timer and can purchase when sale starts.
+● Each user can buy a limited quantity (e.g., max 1 per user).
+● Inventory must be accurate — never sell more items than available.
+● Show real-time stock availability.
+● Process payment and confirm order.
+
+### Non-Functional Requirements
+● Handle **extreme traffic spikes** — 10x-100x normal traffic within seconds.
+● **No overselling** — if 1000 items are available, exactly 1000 orders (not 1001).
+● Low latency — purchase flow must complete in < 1 second.
+● Fairness — first-come-first-served.
+● System should degrade gracefully (static pages, queues) rather than crash.
+
+---
+
+### Capacity Estimation
+● Flash sale: 1000 items available
+● Users attempting to buy: ~1 Million within first 10 seconds
+● QPS spike: 1M / 10 = 100,000 requests/second (100x normal traffic)
+● Read:Write ratio: ~100:1 (most users just checking if sale is still active)
+
+---
+
+### HLD Architecture
+
+```
+                    ┌───────────────┐
+     Users ────────►│  CDN / Static  │  (serve product page, images, countdown timer)
+                    │  Pages         │
+                    └───────┬───────┘
+                            │ (API calls only for purchase)
+                    ┌───────▼───────┐
+                    │  API Gateway   │  (rate limiting, authentication)
+                    └───────┬───────┘
+                            │
+                    ┌───────▼───────┐
+                    │  Request Queue │  (Kafka / SQS — absorb traffic spike)
+                    └───────┬───────┘
+                            │
+                    ┌───────▼───────┐     ┌──────────────┐
+                    │  Order Service │────►│   Redis       │  (inventory counter)
+                    │  (process      │     │  (atomic      │
+                    │   purchases)   │     │   DECR)       │
+                    └───────┬───────┘     └──────────────┘
+                            │
+                    ┌───────▼───────┐
+                    │  Payment       │
+                    │  Service       │
+                    └───────┬───────┘
+                            │
+                    ┌───────▼───────┐
+                    │  Order DB      │
+                    │  (MySQL)       │
+                    └───────────────┘
+```
+
+---
+
+### LLD Key Components
+
+#### Inventory Management (The Core Problem)
+
+**Problem:** 1 million users hitting "Buy" simultaneously for 1000 items. How to ensure exactly 1000 orders?
+
+**Solution: Redis Atomic DECR**
+```
+Before sale starts:
+  SET flash_sale:product_123:stock 1000     (initialize stock count)
+
+When user clicks "Buy":
+  remaining = DECR flash_sale:product_123:stock
+
+  if remaining >= 0:
+      → Purchase ALLOWED (proceed to payment)
+  else:
+      → SOLD OUT (reject immediately)
+      INCR flash_sale:product_123:stock      (restore the over-decrement)
+```
+
+● Redis `DECR` is **atomic** — even with 100K concurrent requests, no race condition.
+● No database lock needed. No distributed lock needed. Single Redis command.
+● This is the key answer interviewers want.
+
+#### Lua Script for Multi-Check (Stock + Per-User Limit)
+```lua
+-- Atomic: check stock AND per-user limit in one operation
+local stock_key = KEYS[1]           -- flash_sale:product_123:stock
+local user_key = KEYS[2]            -- flash_sale:product_123:user:456
+local max_per_user = tonumber(ARGV[1])  -- 1
+
+-- Check if user already purchased
+local user_count = tonumber(redis.call('GET', user_key) or "0")
+if user_count >= max_per_user then
+    return -1   -- user already bought max allowed
+end
+
+-- Check and decrement stock
+local stock = tonumber(redis.call('GET', stock_key) or "0")
+if stock <= 0 then
+    return 0    -- sold out
+end
+
+redis.call('DECR', stock_key)
+redis.call('INCR', user_key)
+return stock - 1  -- remaining stock (success)
+```
+
+#### Request Queue (Absorbing Traffic Spike)
+```
+Without queue:
+  1M requests → directly hit Order Service → service crashes
+
+With queue:
+  1M requests → API Gateway → Kafka/SQS queue → Order Service consumes at safe rate (10K/sec)
+
+Only first ~1000 requests will succeed (stock runs out).
+Remaining requests get "SOLD OUT" response from Redis check (never even reach Order Service).
+```
+
+#### Traffic Control Strategies
+```
+1. CDN for Static Content
+   ● Product page, images, countdown timer — all served from CDN
+   ● Only the "Buy" button triggers an API call
+   ● Reduces 90% of traffic before it reaches backend
+
+2. Rate Limiting
+   ● Max 1 purchase request per user per second
+   ● Block bots and automated scripts
+
+3. Virtual Waiting Room
+   ● When traffic exceeds threshold, users enter a queue
+   ● "You are #4523 in line, estimated wait: 2 minutes"
+   ● Requests released to backend at a controlled rate
+
+4. Pre-validation Layer
+   ● Before hitting Order Service, check Redis: is stock > 0?
+   ● If stock = 0, return "SOLD OUT" immediately (no further processing)
+
+5. Auto-scaling
+   ● Pre-scale servers before the sale starts (scheduled scaling)
+   ● Don't rely on reactive auto-scaling — it's too slow for flash sales
+```
+
+#### Purchase Flow (Step by Step)
+```
+1. User clicks "Buy Now"
+2. API Gateway: authenticate user, rate limit check
+3. Pre-check: Redis DECR stock → if < 0, return "SOLD OUT"
+4. Per-user check: has this user already purchased? (Redis)
+5. Create order in DB with status = PENDING
+6. Call Payment Service → process payment
+7. If payment success → update order to CONFIRMED, publish event
+8. If payment fails → update order to FAILED, INCR stock back in Redis
+9. Return confirmation to user
+
+Payment timeout (e.g., 10 minutes):
+  ● If user doesn't complete payment, release reserved stock
+  ● Scheduled job checks PENDING orders older than 10 min → cancel and restore stock
+```
+
+#### Database Schema
+```sql
+CREATE TABLE flash_sales (
+    sale_id       BIGINT PRIMARY KEY,
+    product_id    BIGINT NOT NULL,
+    sale_price    DECIMAL(10,2) NOT NULL,
+    original_price DECIMAL(10,2) NOT NULL,
+    total_stock   INT NOT NULL,
+    remaining_stock INT NOT NULL,
+    max_per_user  INT DEFAULT 1,
+    start_time    TIMESTAMP NOT NULL,
+    end_time      TIMESTAMP NOT NULL,
+    status        VARCHAR(20) DEFAULT 'SCHEDULED'   -- SCHEDULED, ACTIVE, ENDED
+);
+
+CREATE TABLE flash_sale_orders (
+    order_id    BIGINT PRIMARY KEY,
+    sale_id     BIGINT NOT NULL,
+    user_id     BIGINT NOT NULL,
+    quantity    INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    status      VARCHAR(20) DEFAULT 'PENDING',       -- PENDING, CONFIRMED, FAILED, CANCELLED
+    created_at  TIMESTAMP,
+    paid_at     TIMESTAMP
+);
+CREATE UNIQUE INDEX idx_sale_user ON flash_sale_orders(sale_id, user_id);
+```
+
+#### Key Interview Points
+● **Redis atomic DECR** — This is THE answer for preventing overselling. Single atomic operation, no locks.
+● **Never hit the database for stock check** — Use Redis. DB is too slow for 100K QPS.
+● **CDN everything possible** — Product page, images, timer. Only the purchase API hits backend.
+● **Pre-scale, don't reactive-scale** — Flash sale time is known in advance. Scale up servers 30 minutes before.
+● **Idempotency** — If user double-clicks "Buy", the second request should be rejected (unique constraint on sale_id + user_id).
+● **Stock restoration** — If payment fails or times out, INCR stock back in Redis. Run a reconciliation job to sync Redis with DB.
+● **Bot prevention** — CAPTCHA before purchase, device fingerprinting, rate limiting per IP/user.
+● **Fairness** — FIFO queue ensures first-come-first-served. No priority based on who has faster internet.
+
+---
+---
+
+## 17. Quick Reference — All System Designs Summary
+
+| # | System | Key Concept to Remember |
+|---|--------|------------------------|
+| 1 | URL Shortener | Base62 encoding, 301 vs 302 redirect, cache-heavy |
+| 2 | Rate Limiter | Token Bucket algorithm, Redis Lua for atomicity |
+| 3 | Foundations | CAP theorem, ACID vs BASE, Consistent Hashing |
+| 4 | Notification System | Multi-channel (Push/Email/SMS), separate queues per channel |
+| 5 | Payment System | Double-entry ledger, idempotency key, Saga pattern |
+| 6 | Stock Trading | In-memory order book, price-time priority matching |
+| 7 | Distributed Cache | Consistent hashing, LRU eviction, cache stampede |
+| 8 | Message Queue (Kafka) | Topics, partitions, consumer groups, at-least-once |
+| 9 | API Gateway | Routing, auth, rate limiting, SSL termination |
+| 10 | Task Scheduler | Distributed lock, missed job recovery, dead letter queue |
+| 11 | Distributed Patterns | Circuit Breaker, Saga, Event Sourcing, CQRS, Idempotency |
+| 12 | Interview Checklist | Requirements → HLD → LLD → Scaling |
+| 13 | Netflix | Adaptive bitrate streaming, CDN, chunked video, recommendations |
+| 14 | Facebook/Instagram | Fan-out on Write vs Read (hybrid), feed ranking, social graph |
+| 15 | Cloud Migration | 6 R's, Strangler Fig, CDC for zero-downtime, containerization |
+| 16 | Flash Sale | Redis atomic DECR, pre-scaling, virtual waiting room, CDN static pages |
